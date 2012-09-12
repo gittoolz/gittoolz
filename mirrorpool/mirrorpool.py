@@ -234,11 +234,8 @@ def spawn_repo(workitem):
     if not root:
         root = giturl
 
-    logger.info("giturl=%s root=%s" % (giturl, root) )
-
     try:
         repopath = spawnpath + '/' + reponame
-        logger.info("spawnpath=%s reponame=%s equals repopath=%s" % (spawnpath, reponame, repopath) )
 
         mirrorpath = create_mirrorpath(mirrorpool, reponame)
         if not os.path.isdir(mirrorpath):

@@ -14,42 +14,15 @@ import logging
 import datetime
 import argparse
 import traceback
-import subprocess
 import threading
+import subprocess
+import ConfigParser
 import multiprocessing
 from multiprocessing.pool import ThreadPool
 
-MULTIPLIER = 2
-REPOLIST = "repolist"
-LOGNAME = "mirrorpool"
-GIT = "git"
-REF_SPEC = "+refs/heads/*:refs/heads/*"
-REPO_SPEC_PATTERN = "((^[A-Za-z0-9-_/~@.]+)(:?/))?(([A-Za-z0-9-_/]+)(\.git)?)((:)([A-Za-z0-9-_]+$))?"
-
-REPO_ISURI_PATTERN = "([a-z0-9-_]+)(@)([a-z0-9-_.]+)"
-ROOT_GROUP_NUMBER = 2
-REPONAME_GROUP_NUMBER = 5
-REVISION_GROUP_NUMBER = 9
-REPO_PATH_GROUP_NUMBER = 4
-
-GITOLITE_PATTERN = "(\s)+([#RW_]+\s+)+([A-Za-z0-9-_/]+)"
 GITOLITE_GROUP_NUMBER = 2
-
-MODIFIED_OR_DELETED_PATTERN = "((modified|deleted):\s+)([A-Za-z0-9-_./]+)"
-MODIFIED_OR_DELETED_GROUP_NUMBER = 2
-
-SSH_BANNER_SPAM_LIST = ["************************************************",
-                        "Use of this system by unauthorized persons or",
-                        "in an unauthorized manner is strictly prohibited",]
-
-SUBMODPATH_REGEX  = "path = (repos/(closed|open)/(tests/)?([A-Za-z0-9-_./]+))"
-SUBMODURL_REGEX  = "url = [\w\W]*.com/([A-Za-z0-9-_./]+)\n"
-GIT_INIT_SUBS = "git submodule update --init --reference "
-GIT_INIT = "git submodule init "
-GIT_UPDATE = "git submodule update --reference "
-GIT_EXT = ".git"
-SPACE = " "
-DASH = "--"
+GITOLITE_PATTERN = "(\s)+([#RW_]+\s+)+([A-Za-z0-9-_/]+)"
+GIT_URL = "default"
 
 def verbose_exception(exc_type, exc_value, exc_traceback):
     message = cgitb.text((exc_type, exc_value, exc_traceback))
@@ -92,9 +65,13 @@ class LoggingCommand():
 
                 stdout, stderr = process.communicate()
 
-                for line in [ l for l in stdout.splitlines() if l not in SSH_BANNER_SPAM_LIST ]:
+                banner = ["************************************************",
+                          "Use of this system by unauthorized persons or",
+                          "in an unauthorized manner is strictly prohibited",]
+
+                for line in [ l for l in stdout.splitlines() if l not in banner ]:
                     self.logger.info(line)
-                for line in [ l for l in stderr.splitlines() if l not in SSH_BANNER_SPAM_LIST ]:
+                for line in [ l for l in stderr.splitlines() if l not in banner ]:
                     self.logger.error(line)
 
 
@@ -112,9 +89,9 @@ def main():
     status = 0
     logger = create_console_logger("mirrorpool")
     cmd = LoggingCommand(logger)
-    start = greetings(logger)
 
     cli = get_parser_args()
+    start = greetings(cli, logger)
         
     os.chdir(cli.workingdir)
     repos = cli.repos
@@ -136,7 +113,7 @@ def main():
             results = create_repolist(repo_urls, cli.createlist)
         elif cli.spawnpath:
 
-            results, init_repos = spawn_repos(repo_urls, cli.repos, cli.repolist, cli.mirrorpool, cli.spawnpath if cli.spawnpath else cli.workingdir, logger, cli.forceserial)
+            results, init_repos = spawn_repos(repo_urls, cli.giturl, cli.repos, cli.repolist, cli.mirrorpool, cli.spawnpath if cli.spawnpath else cli.workingdir, logger, cli.forceserial)
 
             if cli.initsubmods:
                 needs_init = []
@@ -147,14 +124,14 @@ def main():
                     init_submodules(needs_init, cli.spawnpath if cli.spawnpath else cli.workingdir, cli.mirrorpool, cli.forceserial, logger)
 
         else:
-            results = refresh_mirrors(repo_urls, cli.repos, cli.repolist, cli.mirrorpool, cli.workingdir, logger, cli.forceserial)
+            results = refresh_mirrors(repo_urls, cli.giturl, cli.repos, cli.repolist, cli.mirrorpool, cli.workingdir, logger, cli.forceserial)
 
     except Exception as ex:
         status = -13
         logger.critical(ex)
         traceback.print_exc()
 
-    status = farewells(results, logger, time.time() - start)
+    status = farewells(cli, results, logger, time.time() - start)
 
     sys.exit(status)
 
@@ -186,7 +163,7 @@ def create_repolist(repo_urls, repolist):
     cmd = LoggingCommand(logger)
 
     if not repolist:
-        repolist = REPOLIST
+        repolist = "repolist"
 
     if os.path.isfile(repolist):
         now = datetime.datetime.now()
@@ -210,12 +187,19 @@ def create_repolist(repo_urls, repolist):
 
     return [(status, text)]
 
-def spawn_repos(repo_urls, repos, repolist, mirrorpool, spawnpath, logger, forceserial):
+def spawn_repos(repo_urls, giturl, repos, repolist, mirrorpool, spawnpath, logger, forceserial):
+
+    logger.info("spawn_repos:")
+    #logger.info("repo_urls: \n%s" % repo_urls)
+    logger.info("giturl: %s" % giturl)
+    logger.info("repos: %s" % repos)
+    logger.info("mirrorpool: %s" % mirrorpool)
+    logger.info("spawnpath: %s" % spawnpath)
+    logger.info("forceserial: %s" % forceserial)
 
     results = []
 
-    workitems, workcount = pack_workitems(repos, repolist, mirrorpool, ensure_spawnpath(spawnpath, logger) )
-
+    workitems, workcount = pack_workitems(giturl, repos, repolist, mirrorpool, ensure_spawnpath(spawnpath, logger) )
 
     logger.info("")
 
@@ -240,24 +224,32 @@ def spawn_repo(workitem):
     status = 0
     text = ""
 
-    repo, width, mirrorpool, spawnpath = workitem
+    refSpec = "+refs/heads/*:refs/heads/*"
 
-    root, reponame, revision = get_repo_spec(repo, mirrorpool)
+    giturl, repo, width, mirrorpool, spawnpath = workitem
+
+    root, reponame, revision = get_repo_spec(giturl, repo, mirrorpool)
 
     logger = create_console_logger(reponame, width)
     cmd = LoggingCommand(logger)
 
+    logger.info("spawn_repo: giturl=%s repo=%s width=%s mirrorpool=%s spawnpath=%s" % (giturl, repo, width, mirrorpool, spawnpath) )
+    logger.info("spawn_repo: root=%s reponame=%s revision=%s" % (root, reponame, revision) )
+
     start = time.time()
 
     if not root:
-        root = GIT_URL
+        root = giturl
+
+    logger.info("giturl=%s root=%s" % (giturl, root) )
 
     try:
         repopath = spawnpath + '/' + reponame
+        logger.info("spawnpath=%s reponame=%s equals repopath=%s" % (spawnpath, reponame, repopath) )
 
         mirrorpath = create_mirrorpath(mirrorpool, reponame)
         if not os.path.isdir(mirrorpath):
-            status, text = create_mirror(root, reponame, revision, mirrorpool, logger)
+            status, text = create_mirror(None, giturl, reponame, revision, mirrorpool, logger)
 
         if not status and os.path.isdir(repopath):
             status = cmd.run("rm -rf %s" % repopath)[0]
@@ -266,17 +258,17 @@ def spawn_repo(workitem):
 
         needs_init = None
 
-        if not status: status = cmd.run("%s clone --shared %s %s" % (GIT, mirrorpath, repopath), spawnpath)[0]
+        if not status: status = cmd.run("git clone --shared %s %s" % (mirrorpath, repopath), spawnpath)[0]
         if os.path.isdir(repopath):
             if not status: status = ensure_status(cmd, repopath)[0] # this is required in both places, here and below
-            if not status: status = cmd.run("%s fetch -f -u %s:/%s %s" % (GIT, GIT_URL, reponame, REF_SPEC), repopath)[0]
-            if not status: status = cmd.run("%s checkout -f %s" % (GIT, revision), repopath)[0]
+            if not status: status = cmd.run("git fetch -f -u %s:/%s %s" % (root, reponame, refSpec), repopath)[0]
+            if not status: status = cmd.run("git checkout -f %s" % (revision), repopath)[0]
             if not status: status = ensure_status(cmd, repopath)[0] # this is required in both places, here and above
-            if not status: status = cmd.run("%s remote rm origin" % GIT, repopath)[0]
-            if not status: status = cmd.run("%s remote add origin %s:/%s" % (GIT, GIT_URL, reponame), repopath)[0]
-            if not status: status = cmd.run("%s config branch.%s.remote origin" % (GIT, revision), repopath)[0]
-            if not status: status = cmd.run("%s config branch.%s.merge refs/heads/%s" % (GIT, revision, revision), repopath)[0]
-            if not status: status = cmd.run("%s rev-parse HEAD" % GIT, repopath)[0]
+            if not status: status = cmd.run("git remote rm origin", repopath)[0]
+            if not status: status = cmd.run("git remote add origin %s:/%s" % (root, reponame), repopath)[0]
+            if not status: status = cmd.run("git config branch.%s.remote origin" % (revision), repopath)[0]
+            if not status: status = cmd.run("git config branch.%s.merge refs/heads/%s" % (revision, revision), repopath)[0]
+            if not status: status = cmd.run("git rev-parse HEAD", repopath)[0]
 
             gitmodules_path = os.path.join(repopath, ".gitmodules")
             if os.path.exists(gitmodules_path):
@@ -297,12 +289,19 @@ def spawn_repo(workitem):
     return status, text, needs_init
 
 
-def refresh_mirrors(repo_urls, repos, repolist, mirrorpool, workingdir, logger, forceserial):
+def refresh_mirrors(repo_urls, giturl, repos, repolist, mirrorpool, workingdir, logger, forceserial):
+
+    logger.info("refresh_mirrors:")
+    #logger.info("repo_urls: \n%s" % repo_urls)
+    logger.info("giturl: %s" % giturl)
+    logger.info("repos: %s" % repos)
+    logger.info("mirrorpool: %s" % mirrorpool)
+    logger.info("workingdir: %s" % workingdir)
+    logger.info("forceserial: %s" % forceserial)
 
     results = []
 
-
-    workitems, workcount = pack_workitems(repos, repolist, mirrorpool, workingdir)
+    workitems, workcount = pack_workitems(giturl, repos, repolist, mirrorpool, workingdir)
 
     logger.info("")
 
@@ -325,13 +324,15 @@ def refresh_mirror(workitem):
     status = 0
     text = ""
 
+    giturl, repo, width, mirrorpool, spawnpath = workitem
 
-    repo, width, mirrorpool, spawnpath = workitem
-
-    root, reponame, revision = get_repo_spec(repo, mirrorpool)
+    root, reponame, revision = get_repo_spec(giturl, repo, mirrorpool)
 
     logger = create_console_logger(reponame, width)
     cmd = LoggingCommand(logger)
+
+    logger.info("refresh_mirror: giturl=%s repo=%s width=%s mirrorpool=%s spawnpath=%s" % (giturl, repo, width, mirrorpool, spawnpath) )
+    logger.info("refresh_mirror: root=%s reponame=%s revision=%s" % (root, reponame, revision) )
 
     start = time.time()
 
@@ -339,13 +340,12 @@ def refresh_mirror(workitem):
         root = mirrorpool
 
     try:
-        print reponame
         mirrorpath = create_mirrorpath(mirrorpool, reponame)
         if os.path.isdir(mirrorpath):
             text = "refresh_mirror: %s here: %s" % (reponame, mirrorpath)
-            status = cmd.run("%s fetch" % GIT, mirrorpath)[0]
+            status = cmd.run("git fetch", mirrorpath)[0]
         else:
-            (status, text) = create_mirror(root, reponame, revision, mirrorpool, logger)
+            (status, text) = create_mirror(root, giturl, reponame, revision, mirrorpool, logger)
 
     except Exception as ex:
         status = -13
@@ -361,6 +361,8 @@ def get_submodules(gitmodules):
     raw_modules = f.read()
     modules =  raw_modules.split("[")
     submods = {}
+    SUBMODPATH_REGEX  = "path = (repos/(closed|open)/(tests/)?([A-Za-z0-9-_./]+))"
+    SUBMODURL_REGEX  = "url = [\w\W]*.com/([A-Za-z0-9-_./]+)\n"
     for mod in modules:
         if mod:
             submodpath_re = re.compile(SUBMODPATH_REGEX)
@@ -381,12 +383,13 @@ def init_submodules(reponames, path, mirrorpool, forceserial, logger):
     for reponame in reponames:
         gitmodules_path = os.path.join(path, reponame, ".gitmodules")
         
+        GIT_INIT = "git submodule init "
         results = []
         if os.path.exists(gitmodules_path):
             submod_workitems, workcount = pack_submodwork(gitmodules_path, mirrorpool, reponame, path)
             for submod_workitem in submod_workitems:
                 sub, mirrorsub, mirrorpool, reponame, path, width = submod_workitem
-                command = GIT_INIT + SPACE + DASH + SPACE + sub
+                command = GIT_INIT + " -- " + sub
                 cmd.run(command, os.path.join(path, reponame))
             
             pool = None
@@ -406,7 +409,7 @@ def init_submodule(workitem):
     logger = create_console_logger(sub, width)
     cmd = LoggingCommand(logger)
     status = 0
-    command = GIT_UPDATE + create_mirrorpath(mirrorpool, mirrorsub) + SPACE + DASH + SPACE + sub
+    command = "git submodule update --reference" + create_mirrorpath(mirrorpool, mirrorsub) + " -- " + sub
     runpath = os.path.join(path, reponame)
     status = cmd.run(command, runpath)[0]
     return status, text
@@ -424,7 +427,14 @@ def get_max_submod_width(submods, mirrorpool):
         width = max([len(submod) for submod in submods])
     return width
 
-def create_mirror(root, reponame, revision, mirrorpool, logger):
+def create_mirror(root, giturl, reponame, revision, mirrorpool, logger):
+
+    print "create_mirror:"
+    print "root: ", root
+    print "giturl: ", giturl
+    print "reponame: ", reponame
+    print "revision: ", revision
+    print "mirrorpool: ", mirrorpool
 
     status = 0
     text = ""
@@ -433,12 +443,15 @@ def create_mirror(root, reponame, revision, mirrorpool, logger):
 
     try:
         if not is_uri(root):
-            root = GIT_URL
+            root = giturl
+
+        logger.info("creat_mirror:")
+        logger.info("root=%s reponame=%s revision=%s mirrorpool=%s" % (root, reponame, revision, mirrorpool) )
 
         mirrorpath = mirrorpool + '/' + reponame + ".git"
 
         text = "create_mirror: %s here: %s" % (reponame, mirrorpath)
-        status = cmd.run("%s clone --mirror %s:/%s %s" % (GIT, root, reponame, mirrorpath), mirrorpool)[0]
+        status = cmd.run("git clone --mirror %s:/%s %s" % (root, reponame, mirrorpath), mirrorpool)[0]
 
     except Exception as ex:
         status = -13
@@ -447,22 +460,70 @@ def create_mirror(root, reponame, revision, mirrorpool, logger):
 
     return status, text
 
+def get_from_conf_or_default(parser, section, key, default):
+
+    value = parser.get(section, key) if parser.has_option(section, key) else default
+
+    if isinstance(value, (list, tuple) ):
+        return value
+    elif isinstance(value, str):
+        value = value.strip()
+
+        value = value.split()
+
+        if len(value) == 0:
+            return default
+        if len(value) > 1:
+            return value
+        return value[0]
+    return value
+    
+
+def load_from_conf(mirrorpool):
+
+    conf = "mirrorpool.conf"
+    parser = ConfigParser.ConfigParser()
+    parser.read(os.path.join(mirrorpool, conf) )
+
+    giturl = get_from_conf_or_default(parser, conf, 'giturl', None)
+    repos = get_from_conf_or_default(parser, conf, 'repos', [])
+    spawnpath = get_from_conf_or_default(parser, conf, 'spawnpath', None)
+
+    return giturl, repos, spawnpath
+
 def get_parser_args():
 
     parser = argparse.ArgumentParser(description='mirrorpool.py options and arguments:')
 
     parser.add_argument(
-        '--forceserial',
-        default=False, 
-        action="store_true",
-        dest="forceserial",
-        help="forces the program to run in single process mode; good for debug")
+        '--mirrorpool', 
+        default=".mirrorpool",
+        metavar="NAME",
+        dest="mirrorpool",
+        help="a folder where the mirrorpool is to be setup; defaults to .mirrorpool")
+    
+    known, remaining = parser.parse_known_args('--mirrorpool')
+    giturl, repos, spawnpath = load_from_conf(known.mirrorpool)
+
+    parser.add_argument(
+        '--giturl',
+        default=giturl,
+        dest="giturl",
+        help="overrides possible definition of giturl param in %s/mirrorpool.conf" % known.mirrorpool)
     parser.add_argument(
         '--repos',
-        default=[], 
+        default=repos, 
         nargs='+', 
         dest="repos",
         help="relative path to local path or uri to remote server + repo")
+    parser.add_argument(
+        '--spawn',
+        default=None, 
+        nargs='?', 
+        const=spawnpath if spawnpath else os.getcwd(),
+        metavar="PATH",
+        dest="spawnpath",
+        help="boolean flag for spawning repos local to the current working directory or with PATH specified to the relative PATH from current working dir")
     parser.add_argument(
         '--repolist',
         default=None,
@@ -474,23 +535,9 @@ def get_parser_args():
         default=None,
         metavar="NAME",
         nargs='?', 
-        const=REPOLIST, 
+        const="repolist", 
         dest="createlist",
-        help="creates a repolist with optional name or defaults to %s; calls ssh -T git@GITURL where GITURL defaults to %s; can be overridden with --giturl option" %(REPOLIST, GIT_URL) )
-    parser.add_argument(
-        '--mirrorpool', 
-        default="~/.mirrorpool",
-        metavar="NAME",
-        dest="mirrorpool",
-        help="a folder where the mirrorpool is to be setup; defaults to ~/mirrorpool")
-    parser.add_argument(
-        '--spawn',
-        default=None, 
-        nargs='?', 
-        const=os.getcwd(),
-        metavar="PATH",
-        dest="spawnpath",
-        help="boolean flag for spawning repos local to the current working directory")
+        help="creates a repolist with optional name or defaults to %s; calls ssh -T GITURL where GITURL is defined in %s/mirrorpool.conf; can be overridden with --giturl option" % ("repolist", known.mirrorpool) )
     parser.add_argument(
         '--workingdir', 
         default=os.getcwd(),
@@ -503,11 +550,6 @@ def get_parser_args():
         dest="revision",
         help="the revision used in spawn; defaults to master; is overrided by repo specification repo:version")
     parser.add_argument(
-        '--giturl',
-        default=GIT_URL,
-        dest="giturl",
-        help="override the default giturl of %s" % GIT_URL)
-    parser.add_argument(
         '--version', 
         default=None, 
         action='version', 
@@ -519,68 +561,85 @@ def get_parser_args():
         action="store_true",
         dest="initsubmods",
         help="if one of the specified repos contains submodules, initialize them")
+    parser.add_argument(
+        '--forceserial',
+        default=False, 
+        action="store_true",
+        dest="forceserial",
+        help="forces the program to run in single process mode; good for debug")
 
     return parser.parse_args()
 
-def mirrorpool_logo():
+def mirrorpool_logo(cli):
 
     logo = []
     logo.append("                                                                     ")
-    logo.append("*********************************************************************")
-    logo.append("*MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMNM*")
-    logo.append("*MMMMMMMMMMMMMMMMMMMMMMMMMM  mirrorpool.py  MMMMMMMMMMMMMMMMMMMNDNNO*")
-    logo.append("*MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMDOO87*")
-    logo.append("*MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM$77$+*")
-    logo.append("*MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMN$$?II*")
-    logo.append("*MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMNNI,?~7*")
-    logo.append("*MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMZ7:I,$*")
-    logo.append("*MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMNNNNNNDDDDDDDD888888888888888O:=~,,*")
-    logo.append("*MMMMMMMMMMMMNNNNNDDD8888888888888888OOOOOOOOOOOOOOOOOOOOOOOOII:~..,*")
-    logo.append("*MNNDDD8D88888888OOOOOOOOOOOOZZZZZZZZZZZZZZZZZZZZ$$$$$$$$$$$O,,:Z,,,*")
-    logo.append("*88888OOOOOOOOZZZZZZZZZ$$$$$$$$$$777777777777777I77II7777I?$$~?D++~I*")
-    logo.append("*OOOOOZZZZZZ$$$$$7777777IIIIIIII????????????++?$O8OO$7?==~?~:DNO$??7*")
-    logo.append("*ZZZZ$$$$$77777IIIII??????+++++++=====~IZOZ7I=:~::,,,,,:::~ONDZZO7?7*")
-    logo.append("*$$77777IIII?????++++=====~~~~~~:?ZZOZ+~~:,,,,,:,,,::,,,??DNNZO=,...*")
-    logo.append("*77III????++++====~~~~:::::=?I?~~OO+~:,,,:::.::,:,,,:~Z8DDD$7:,.....*")
-    logo.append("*II???+++====~~~~::::::??+=+~~~OO7=::~~::::.:,::::~I?I+??7=,,,......*")
-    logo.append("*??+++===~~~~~:::::~$?+=~~~~:~?IZ87$$7?::~::77I77I7II?II?~:::::,,...*")
-    logo.append("*+++===~~~~::::::IO?=~~~~:::::::??+?+ZZ$$?+I=::+I7777$77I?I?+=~:::,.*")
-    logo.append("*+++===~~~::::+$Z+=~~~~:::::,:::::,:=?::+$OZZ7?I7$7I?++IIII+++II??,.*")
-    logo.append("*+====~~~::::7?+==~~~~::::,,,::~:,:,,.....:~:,:=?7ZO88OOZ$$I????+,,,*")
-    logo.append("*+====~~~~::,?+===~~~:::::,:::~=:.,,:=:,,,,,,,.........,:~~~~~:,,,..*")
-    logo.append("*++====~~~:::?===~~~~~:::,,:::~~,,,,,,,,,,,:~===~:::,,:,,,,,,,,,,,,.*")
-    logo.append("*++++====~~~~8~I===~~~~::::::::~=.:,,,,,,,,,,,,,,,,,,,,,=?+??=:::,..*")
-    logo.append("*???++++===~~~=,~?I===~~~~~~::::::~=~,,,,,,,,,,,,,,,,,::::~~=:.,,,,.*")
-    logo.append("*II????++++===~~I:~~+$?====~~~~~~:::~:~==~,,::::::::::,,,,,,,,:::,:,*")
-    logo.append("*7IIII?????+++++==~$=~=~~?7?======~~~~~~~~~~~~~+++=~::::~~~~~~~~:~~~*")
-    logo.append("*7777IIIII??????+++++==II=====+I7I+=+++=====================+++++???*")
-    logo.append("*$$777777IIIIII??????++++++=?I?======+?I7I?++++?++++++++++++++++++++*")
-    logo.append("*$$$$$$77777777IIIIIIIIII????????++?II?++++++++++?I777I??++++=,~=~:+*")
-    logo.append("*ZZZZ$$$$$$$$$77777777IIIIIIIIIIIII?II????+??+?II7I??++?+???????????*")
-    logo.append("*ZZZZZZZZ$$$$$$$$$$$77777777777777IIIIIIIIIIIIIIIIIIIIIII?????????II*")
-    logo.append("*OOOOOOZZZZZZZZZZ$$$$$$$$$$$$$$$$77777777777777777777777777777777777*")
-    logo.append("*OOOOOOOOOOOZZZZZZZZZZZZZZZZZ$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$*")
-    logo.append("*88888OOOOOOOOOOOOOOOOZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ*")
-    logo.append("*888888888888OO88OOOOOOOOOOOOOOOOOOOOOOOOOOOOZZZZZZZZZZZZZZZZZZZZZOO*")
-    logo.append("*8888888888888888888888888OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO  sai  OO*")
-    logo.append("*DDDDDD8D8888888888888888888888888888888OOO88O8OOOOOOOOOOOOOOOOO88OO*")
-    logo.append("*********************************************************************")
-    logo.append("* cmdargs: " + ' '.join(sys.argv) )
-    logo.append("*********************************************************************")
-    logo.append("                                                                     ")
+    logo.append("  -----------------------------------------------------------------  ")
+    logo.append(" /MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMN\ ")
+    logo.append("|MMMMMMMMMMMMMMMMMMMMMMMMMM  mirrorpool.py  MMMMMMMMMMMMMMMMMMMNDNNO|")
+    logo.append("|MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMDOO87|")
+    logo.append("|MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM$77$+|")
+    logo.append("|MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMN$$?II|")
+    logo.append("|MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMNNI,?~7|")
+    logo.append("|MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMZ7:I,$|")
+    logo.append("|MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMNNNNNNDDDDDDDD888888888888888O:=~,,|")
+    logo.append("|MMMMMMMMMMMMNNNNNDDD8888888888888888OOOOOOOOOOOOOOOOOOOOOOOOII:~..,|")
+    logo.append("|MNNDDD8D88888888OOOOOOOOOOOOZZZZZZZZZZZZZZZZZZZZ$$$$$$$$$$$O,,:Z,,,|")
+    logo.append("|88888OOOOOOOOZZZZZZZZZ$$$$$$$$$$777777777777777I77II7777I?$$~?D++~I|")
+    logo.append("|OOOOOZZZZZZ$$$$$7777777IIIIIIII????????????++?$O8OO$7?==~?~:DNO$??7|")
+    logo.append("|ZZZZ$$$$$77777IIIII??????+++++++=====~IZOZ7I=:~::,,,,,:::~ONDZZO7?7|")
+    logo.append("|$$77777IIII?????++++=====~~~~~~:?ZZOZ+~~:,,,,,:,,,::,,,??DNNZO=,...|")
+    logo.append("|77III????++++====~~~~:::::=?I?~~OO+~:,,,:::.::,:,,,:~Z8DDD$7:,.....|")
+    logo.append("|II???+++====~~~~::::::??+=+~~~OO7=::~~::::.:,::::~I?I+??7=,,,......|")
+    logo.append("|??+++===~~~~~:::::~$?+=~~~~:~?IZ87$$7?::~::77I77I7II?II?~:::::,,...|")
+    logo.append("|+++===~~~~::::::IO?=~~~~:::::::??+?+ZZ$$?+I=::+I7777$77I?I?+=~:::,.|")
+    logo.append("|+++===~~~::::+$Z+=~~~~:::::,:::::,:=?::+$OZZ7?I7$7I?++IIII+++II??,.|")
+    logo.append("|+====~~~::::7?+==~~~~::::,,,::~:,:,,.....:~:,:=?7ZO88OOZ$$I????+,,,|")
+    logo.append("|+====~~~~::,?+===~~~:::::,:::~=:.,,:=:,,,,,,,.........,:~~~~~:,,,..|")
+    logo.append("|++====~~~:::?===~~~~~:::,,:::~~,,,,,,,,,,,:~===~:::,,:,,,,,,,,,,,,.|")
+    logo.append("|++++====~~~~8~I===~~~~::::::::~=.:,,,,,,,,,,,,,,,,,,,,,=?+??=:::,..|")
+    logo.append("|???++++===~~~=,~?I===~~~~~~::::::~=~,,,,,,,,,,,,,,,,,::::~~=:.,,,,.|")
+    logo.append("|II????++++===~~I:~~+$?====~~~~~~:::~:~==~,,::::::::::,,,,,,,,:::,:,|")
+    logo.append("|7IIII?????+++++==~$=~=~~?7?======~~~~~~~~~~~~~+++=~::::~~~~~~~~:~~~|")
+    logo.append("|7777IIIII??????+++++==II=====+I7I+=+++=====================+++++???|")
+    logo.append("|$$777777IIIIII??????++++++=?I?======+?I7I?++++?++++++++++++++++++++|")
+    logo.append("|$$$$$$77777777IIIIIIIIII????????++?II?++++++++++?I777I??++++=,~=~:+|")
+    logo.append("|ZZZZ$$$$$$$$$77777777IIIIIIIIIIIII?II????+??+?II7I??++?+???????????|")
+    logo.append("|ZZZZZZZZ$$$$$$$$$$$77777777777777IIIIIIIIIIIIIIIIIIIIIII?????????II|")
+    logo.append("|OOOOOOZZZZZZZZZZ$$$$$$$$$$$$$$$$77777777777777777777777777777777777|")
+    logo.append("|OOOOOOOOOOOZZZZZZZZZZZZZZZZZ$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$|")
+    logo.append("|88888OOOOOOOOOOOOOOOOZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ|")
+    logo.append("|888888888888OO88OOOOOOOOOOOOOOOOOOOOOOOOOOOOZZZZZZZZZZZZZZZZZZZZZOO|")
+    logo.append("|8888888888888888888888888OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO  sai  OO|")
+    logo.append(" \DDDDD8D8888888888888888888888888888888OOO88O8OOOOOOOOOOOOOOOOO88O/ ")
+    logo.append("  -----------------------------------------------------------------  ")
+    logo.append("")
+    logo.append("  cmdargs     = " + ' '.join(sys.argv[1:]) )
+    logo.append("  mirrorpool  = %s" % cli.mirrorpool)
+    logo.append("  giturl      = %s" % cli.giturl)
+    logo.append("  repos       = %s" % cli.repos)
+    logo.append("  spawnpath   = %s" % cli.spawnpath)
+    logo.append("  repolist    = %s" % cli.repolist)
+    logo.append("  createlist  = %s" % cli.createlist)
+    logo.append("  workingdir  = %s" % cli.workingdir)
+    logo.append("  revision    = %s" % cli.revision)
+    logo.append("  initsubmods = %s" % cli.initsubmods)
+    logo.append("  forceserial = %s" % cli.forceserial)
+    logo.append("")
 
     return logo
 
-def greetings(logger):
+def greetings(cli, logger):
 
     beg = time.time()
-    [logger.info(line) for line in mirrorpool_logo()]
+    [logger.info(line) for line in mirrorpool_logo(cli)]
     return beg
 
-def farewells(results, logger, duration):
+def farewells(cli, results, logger, duration):
 
     failures = 0
-    [logger.info(line) for line in mirrorpool_logo()]
+    [logger.info(line) for line in mirrorpool_logo(cli)]
+
     if results:
         results.sort(key=lambda r: r[0])
         for (ec, txt) in results:
@@ -590,6 +649,7 @@ def farewells(results, logger, duration):
             else:
                 logger.info("success(%d): %s" % (ec, txt) )
 
+    logger.info("                                                           ")
     logger.info("completed %d tasks in %f seconds with %d failures          " % (len(results), duration, failures) )
     logger.info("                                                           ")
     logger.info("thank you for using mirrorpool.py --sai *hugs*             ")
@@ -600,12 +660,10 @@ def farewells(results, logger, duration):
             
 def collect_repos(repos, repolist, mirrorpool):
 
+    print "mirrorpool: ", mirrorpool
+
     if not repos and not repolist and os.path.exists(mirrorpool):
-        repos = []
-        for top, dirs, files in os.walk(mirrorpool):
-            for d in dirs:
-                if os.path.isdir(os.path.join(top, d)) and d.endswith('.git'):
-                    repos.append(top + "/" + d)
+        repos = [dir for dir in os.listdir(mirrorpool) if os.path.isdir(os.path.join(mirrorpool, dir) ) and dir.endswith('.git')]
     else:
         repo_set = set(repos)
         if repolist and os.path.isfile(repolist):
@@ -614,19 +672,39 @@ def collect_repos(repos, repolist, mirrorpool):
                 repo_set.add(line.rstrip('\n') )
         repos = list(repo_set)
 
+    print "return from collect_repos with: repos=%s" % repos
+
     return repos
 
-def get_max_width(repos, mirrorpool):
+def collect_repos_old(repos, repolist, mirrorpool):
+
+    print "mirrorpool: ", mirrorpool
+
+    if not repos and not repolist and os.path.exists(mirrorpool):
+        print "first branch"
+        repos = []
+        for top, dirs, files in os.walk(mirrorpool):
+            for d in dirs:
+                if os.path.isdir(os.path.join(top, d)) and d.endswith('.git'):
+                    repos.append(top + "/" + d)
+    else:
+        print "second branch"
+        repo_set = set(repos)
+        if repolist and os.path.isfile(repolist):
+            repo_file = open(repolist, 'r')
+            for line in repo_file.readlines():
+                repo_set.add(line.rstrip('\n') )
+        repos = list(repo_set)
+
+    print "return from collect_repos with: repos=%s" % repos
+
+    return repos
+
+def get_max_width(giturl, repos, mirrorpool):
     width = 0
     if len(repos):
-        width = max([get_reponame_width(repo, mirrorpool) for repo in repos])
+        width = max([get_reponame_width(giturl, repo, mirrorpool) for repo in repos])
     return width
-
-def pack_workitems_old(repos, mirrorpool, workingdir):
-
-    width = get_max_width(repos, mirrorpool)
-    workitems = [(repo, width, mirrorpool, workingdir) for repo in repos]
-    return workitems
 
 def ensure_spawnpath(spawnpath, logger):
 
@@ -639,27 +717,28 @@ def ensure_spawnpath(spawnpath, logger):
 
 def ensure_status(cmd, repopath):
 
-    status, text = cmd.run("%s status" % GIT, repopath)
+    status, text = cmd.run("git status", repopath)
 
     if not status and not text.endswith('nothing to commit (working directory clean)\n'):
 
-        matches = re.findall(MODIFIED_OR_DELETED_PATTERN, text)
-        files = [match[MODIFIED_OR_DELETED_GROUP_NUMBER] for match in matches]
+        pattern = "((modified|deleted):\s+)([A-Za-z0-9-_./]+)"
+        matches = re.findall(pattern, text)
+        files = [match[2] for match in matches]
 
         text = ""
         for file in files:
-            s, t = cmd.run("%s update-index --assume-unchanged %s" %(GIT, file), repopath)
+            s, t = cmd.run("git update-index --assume-unchanged %s" % file, repopath)
             status += s
             text += t
 
     return status, text
 
-def pack_workitems(repos, repolist, mirrorpool, workingdir):
+def pack_workitems(giturl, repos, repolist, mirrorpool, workingdir):
 
     mirrorpool = unix_path(os.path.abspath(mirrorpool) )
     repos = collect_repos(repos, repolist, mirrorpool)
-    width = get_max_width(repos, mirrorpool)
-    workitems = [(repo, width, mirrorpool, workingdir) for repo in repos]
+    width = get_max_width(giturl, repos, mirrorpool)
+    workitems = [(giturl, repo, width, mirrorpool, workingdir) for repo in repos]
     return workitems, len(workitems)
 
 def get_multiprocessing_pool(workcount, logger):
@@ -677,25 +756,22 @@ def get_multiprocessing_pool(workcount, logger):
             processcount/= 2
     return pool, processcount
 
-def get_repo_spec(repo, mirrorpool):
-    match = re.search(REPO_SPEC_PATTERN, unix_path(repo) )
-    root = match.group(ROOT_GROUP_NUMBER)
-    reponame = match.group(REPONAME_GROUP_NUMBER)
-    revision = match.group(REVISION_GROUP_NUMBER)
+def get_repo_spec(giturl, repo, mirrorpool):
+  
+    pattern = "((__MIRRORPOOL__|(ssh://)?([A-Za-z0-9\-_.]+)(@)([A-Za-z0-9\-_.]+))(:/|/))?([A-Za-z0-9\-_/]+)(.git|)((:)([A-Za-z0-9\-_]+))?".replace("__MIRRORPOOL__", mirrorpool)
+    match = re.search(pattern, unix_path(repo) )
+    root = match.group(2)
+    reponame = match.group(8)
+    revision = match.group(12)
 
-    # the first part of the path (eg yocto) will come out as part of the root,
-    # so you need to add it in to the reponame
-    if root and root.startswith(mirrorpool):
-        mirrorpool_end = root.find(mirrorpool) + len(mirrorpool)
-        reponame = root[mirrorpool_end+1:] + "/" + reponame
-    elif root and not root.startswith(GIT_URL):
-        reponame = root + "/" + reponame
     return root, reponame, revision if revision else "master"
 
-def get_reponame_width(repo, mirrorpool):
+def get_reponame_width(giturl, repo, mirrorpool):
     width = 0
-    root, reponame, revision = get_repo_spec(repo, mirrorpool)
+    root, reponame, revision = get_repo_spec(giturl, repo, mirrorpool)
+
     width = len(reponame)
+
     if root:
         width += len(root) + 1 # for the slash
     return width
@@ -709,7 +785,8 @@ def create_mirrorpath(mirrorpool, reponame):
 
 def is_uri(repostring):
 
-    return repostring != None and re.match(REPO_ISURI_PATTERN, repostring) != None
+    pattern = "([a-z0-9-_]+)(@)([a-z0-9-_.]+)"
+    return repostring != None and re.match(pattern, repostring) != None
 
 def get_processcount(work_count, mulitplier = 1):
 

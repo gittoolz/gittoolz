@@ -189,14 +189,6 @@ def create_repolist(repo_urls, repolist):
 
 def spawn_repos(repo_urls, giturl, repos, repolist, mirrorpool, spawnpath, logger, forceserial):
 
-    logger.info("spawn_repos:")
-    #logger.info("repo_urls: \n%s" % repo_urls)
-    logger.info("giturl: %s" % giturl)
-    logger.info("repos: %s" % repos)
-    logger.info("mirrorpool: %s" % mirrorpool)
-    logger.info("spawnpath: %s" % spawnpath)
-    logger.info("forceserial: %s" % forceserial)
-
     results = []
 
     workitems, workcount = pack_workitems(giturl, repos, repolist, mirrorpool, ensure_spawnpath(spawnpath, logger) )
@@ -204,14 +196,18 @@ def spawn_repos(repo_urls, giturl, repos, repolist, mirrorpool, spawnpath, logge
     logger.info("")
 
     pool = None
-    if not forceserial:
-        pool, processcount = get_multiprocessing_pool(workcount, logger)
-    if pool:
-        logger.info("running mirrorpool.py in multi-process mode with a pool size of %d" % processcount)
-        results = pool.map(spawn_repo, workitems)
-    else:
-        logger.info("PUNT!  running mirrorpool.py in serial mode because multiprocessing failed...")
+
+    if forceserial:
+        logger.info("running mirrorpool.py in serial mode because --forceserial was set...")
         results = [spawn_repo(workitem) for workitem in workitems]
+    else:
+        pool, processcount = get_multiprocessing_pool(workcount, logger)
+        if pool:
+            logger.info("running mirrorpool.py in multi-process mode with a pool size of %d" % processcount)
+            results = pool.map(spawn_repo, workitems)
+        else:
+            logger.info("PUNT!  running mirrorpool.py in serial mode because multiprocessing failed...")
+            results = [spawn_repo(workitem) for workitem in workitems]
 
     logger.info("")
 
@@ -232,9 +228,6 @@ def spawn_repo(workitem):
 
     logger = create_console_logger(reponame, width)
     cmd = LoggingCommand(logger)
-
-    logger.info("spawn_repo: giturl=%s repo=%s width=%s mirrorpool=%s spawnpath=%s" % (giturl, repo, width, mirrorpool, spawnpath) )
-    logger.info("spawn_repo: root=%s reponame=%s revision=%s" % (root, reponame, revision) )
 
     start = time.time()
 
@@ -291,14 +284,6 @@ def spawn_repo(workitem):
 
 def refresh_mirrors(repo_urls, giturl, repos, repolist, mirrorpool, workingdir, logger, forceserial):
 
-    logger.info("refresh_mirrors:")
-    #logger.info("repo_urls: \n%s" % repo_urls)
-    logger.info("giturl: %s" % giturl)
-    logger.info("repos: %s" % repos)
-    logger.info("mirrorpool: %s" % mirrorpool)
-    logger.info("workingdir: %s" % workingdir)
-    logger.info("forceserial: %s" % forceserial)
-
     results = []
 
     workitems, workcount = pack_workitems(giturl, repos, repolist, mirrorpool, workingdir)
@@ -330,9 +315,6 @@ def refresh_mirror(workitem):
 
     logger = create_console_logger(reponame, width)
     cmd = LoggingCommand(logger)
-
-    logger.info("refresh_mirror: giturl=%s repo=%s width=%s mirrorpool=%s spawnpath=%s" % (giturl, repo, width, mirrorpool, spawnpath) )
-    logger.info("refresh_mirror: root=%s reponame=%s revision=%s" % (root, reponame, revision) )
 
     start = time.time()
 
@@ -429,13 +411,6 @@ def get_max_submod_width(submods, mirrorpool):
 
 def create_mirror(root, giturl, reponame, revision, mirrorpool, logger):
 
-    print "create_mirror:"
-    print "root: ", root
-    print "giturl: ", giturl
-    print "reponame: ", reponame
-    print "revision: ", revision
-    print "mirrorpool: ", mirrorpool
-
     status = 0
     text = ""
 
@@ -444,9 +419,6 @@ def create_mirror(root, giturl, reponame, revision, mirrorpool, logger):
     try:
         if not is_uri(root):
             root = giturl
-
-        logger.info("creat_mirror:")
-        logger.info("root=%s reponame=%s revision=%s mirrorpool=%s" % (root, reponame, revision, mirrorpool) )
 
         mirrorpath = mirrorpool + '/' + reponame + ".git"
 
@@ -657,13 +629,18 @@ def farewells(cli, results, logger, duration):
     logger.info("                                                           ")
 
     return failures
+
+def get_mirrors(mirrorpool):
+    for root, dirs, files in os.walk(mirrorpool):
+        for dir in dirs:
+            if dir.endswith('.git'):
+                yield os.path.join(root, dir)
             
 def collect_repos(repos, repolist, mirrorpool):
 
-    print "mirrorpool: ", mirrorpool
-
     if not repos and not repolist and os.path.exists(mirrorpool):
-        repos = [dir for dir in os.listdir(mirrorpool) if os.path.isdir(os.path.join(mirrorpool, dir) ) and dir.endswith('.git')]
+        repos = [mirror for mirror in get_mirrors(mirrorpool)]
+        #repos = [dir for dir in os.listdir(mirrorpool) if os.path.isdir(os.path.join(mirrorpool, dir) ) and dir.endswith('.git')]
     else:
         repo_set = set(repos)
         if repolist and os.path.isfile(repolist):
@@ -672,31 +649,23 @@ def collect_repos(repos, repolist, mirrorpool):
                 repo_set.add(line.rstrip('\n') )
         repos = list(repo_set)
 
-    print "return from collect_repos with: repos=%s" % repos
-
     return repos
 
 def collect_repos_old(repos, repolist, mirrorpool):
 
-    print "mirrorpool: ", mirrorpool
-
     if not repos and not repolist and os.path.exists(mirrorpool):
-        print "first branch"
         repos = []
         for top, dirs, files in os.walk(mirrorpool):
             for d in dirs:
                 if os.path.isdir(os.path.join(top, d)) and d.endswith('.git'):
                     repos.append(top + "/" + d)
     else:
-        print "second branch"
         repo_set = set(repos)
         if repolist and os.path.isfile(repolist):
             repo_file = open(repolist, 'r')
             for line in repo_file.readlines():
                 repo_set.add(line.rstrip('\n') )
         repos = list(repo_set)
-
-    print "return from collect_repos with: repos=%s" % repos
 
     return repos
 

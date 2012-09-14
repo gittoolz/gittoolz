@@ -20,6 +20,23 @@ import ConfigParser
 import multiprocessing
 from multiprocessing.pool import ThreadPool
 
+
+MIRRORPOOL_CONF = "mirrorpool.conf"
+CONF_CONTENTS = """
+[mirrorpool.conf]
+
+# set the giturl variable so that you don't have type --giturl GITURL 
+# on the command line for every command
+#giturl = GITURL
+
+# set this option only if you want to run all your commands over this
+# list of repos; not common
+#repos = REPO1 REPO2
+
+# set spawnpath to a value that will be used by default when you type
+# --spawn; you should still be able to override with --spawn SPAWNPATH
+#spawnpath = SPAWNPATH
+"""
 GITOLITE_GROUP_NUMBER = 2
 GITOLITE_PATTERN = "(\s)+([#RW_]+\s+)+([A-Za-z0-9-_/]+)"
 GIT_URL = "default"
@@ -54,7 +71,6 @@ class LoggingCommand():
 
             doShell=False #perhaps parameterize later?
 
-
             try:
                 process = subprocess.Popen(
                     command if doShell else command.split(),
@@ -73,7 +89,6 @@ class LoggingCommand():
                     self.logger.info(line)
                 for line in [ l for l in stderr.splitlines() if l not in banner ]:
                     self.logger.error(line)
-
 
                 text = os.linesep.join([stdout, stderr]) 
                 status = process.returncode
@@ -106,8 +121,14 @@ def main():
         matches = re.findall(GITOLITE_PATTERN, response)    
         repo_urls = ["%s:/%s" % (cli.giturl, match[GITOLITE_GROUP_NUMBER]) for match in matches]
 
-        logger.info("making mirrorpool: %s" % cli.mirrorpool)
-        status = cmd.run("mkdir -p %s" % cli.mirrorpool, os.getcwd())
+        if not os.path.isdir(cli.mirrorpool):
+            logger.info("making mirrorpool: %s" % cli.mirrorpool)
+            status = cmd.run("mkdir -p %s" % cli.mirrorpool, os.getcwd())
+
+        conf = os.path.join(cli.mirrorpool, MIRRORPOOL_CONF)
+        if not os.path.isfile(conf):
+            f = open(conf, 'w')
+            f.write(CONF_CONTENTS)
         
         if cli.createlist:
             results = create_repolist(repo_urls, cli.createlist)
@@ -134,6 +155,7 @@ def main():
     status = farewells(cli, results, logger, time.time() - start)
 
     sys.exit(status)
+
 
 def get_repo_urls(giturl):
 
@@ -388,7 +410,7 @@ def init_submodule(workitem):
     logger = create_console_logger(sub, width)
     cmd = LoggingCommand(logger)
     status = 0
-    command = "git submodule update --reference" + create_mirrorpath(mirrorpool, mirrorsub) + " -- " + sub
+    command = "git submodule update --reference " + create_mirrorpath(mirrorpool, mirrorsub) + " -- " + sub
     runpath = os.path.join(path, reponame)
     status = cmd.run(command, runpath)[0]
     return status, text
@@ -450,13 +472,12 @@ def get_from_conf_or_default(parser, section, key, default):
 
 def load_from_conf(mirrorpool):
 
-    conf = "mirrorpool.conf"
     parser = ConfigParser.ConfigParser()
-    parser.read(os.path.join(mirrorpool, conf) )
+    parser.read(os.path.join(mirrorpool, MIRRORPOOL_CONF) )
 
-    giturl = get_from_conf_or_default(parser, conf, 'giturl', None)
-    repos = get_from_conf_or_default(parser, conf, 'repos', [])
-    spawnpath = get_from_conf_or_default(parser, conf, 'spawnpath', None)
+    giturl = get_from_conf_or_default(parser, MIRRORPOOL_CONF, 'giturl', None)
+    repos = get_from_conf_or_default(parser, MIRRORPOOL_CONF, 'repos', [])
+    spawnpath = get_from_conf_or_default(parser, MIRRORPOOL_CONF, 'spawnpath', None)
 
     return giturl, repos, spawnpath
 
@@ -478,7 +499,7 @@ def get_parser_args():
         '--giturl',
         default=giturl,
         dest="giturl",
-        help="overrides possible definition of giturl param in %s/mirrorpool.conf" % known.mirrorpool)
+        help="overrides possible definition of giturl param in %s/%s" % (known.mirrorpool, MIRRORPOOL_CONF) )
     parser.add_argument(
         '--repos',
         default=repos, 
@@ -506,7 +527,7 @@ def get_parser_args():
         nargs='?', 
         const="repolist", 
         dest="createlist",
-        help="creates a repolist with optional name or defaults to %s; calls ssh -T GITURL where GITURL is defined in %s/mirrorpool.conf; can be overridden with --giturl option" % ("repolist", known.mirrorpool) )
+        help="creates a repolist with optional name or defaults to %s; calls ssh -T GITURL where GITURL is defined in %s/%s; can be overridden with --giturl option" % ("repolist", known.mirrorpool, MIRRORPOOL_CONF) )
     parser.add_argument(
         '--workingdir', 
         default=os.getcwd(),
@@ -637,7 +658,6 @@ def collect_repos(repos, repolist, mirrorpool):
 
     if not repos and not repolist and os.path.exists(mirrorpool):
         repos = [mirror for mirror in get_mirrors(mirrorpool)]
-        #repos = [dir for dir in os.listdir(mirrorpool) if os.path.isdir(os.path.join(mirrorpool, dir) ) and dir.endswith('.git')]
     else:
         repo_set = set(repos)
         if repolist and os.path.isfile(repolist):

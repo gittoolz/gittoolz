@@ -374,13 +374,11 @@ def get_submodules(gitmodules):
             url = submodurl_match.group(1)
             submods[path] = url
     f.close()
-    print submods
     return submods
 
 
 def init_submodules(reponames, path, mirrorpool, forceserial, logger):
     cmd = LoggingCommand(logger)
-    print mirrorpool
     for reponame in reponames:
         gitmodules_path = os.path.join(path, reponame, ".gitmodules")
         
